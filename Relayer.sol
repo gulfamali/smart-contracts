@@ -3,6 +3,7 @@
 pragma solidity ^0.8.17;
 
 interface IERC20 {
+    function allowance(address owner, address spender) external view returns (uint);
     function transfer(address recipient, uint256 value) external returns (bool);
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
@@ -10,7 +11,7 @@ interface IERC20 {
 contract Relayer {
 
     address owner;
-    mapping(address => mapping( uint256 => bool)) nonces;
+    mapping(address => uint256) nonces;
 
     constructor() {
         owner = msg.sender;
@@ -24,18 +25,74 @@ contract Relayer {
         uint256 nonce,
         bytes memory signature
     ) external {
-        require(msg.sender == owner, "Forbidden");
-        require(!nonces[msg.sender][nonce], "Invalid nonce");
-
-        bytes32 message = prefixed(keccak256(abi.encodePacked(from, to, amount, nonce, this)));
-        require(verify(message, signature) == from, "Invalid signature");
-
-        nonces[msg.sender][nonce] = true;
+        bytes32 signedMessage = prefixed(transferFromHash(token, from, to, amount, nonce));
+        require(verify(signedMessage, signature, nonce) == from, "Invalid signature");
+        nonces[msg.sender]++;
 
         require(IERC20(token).transferFrom(from, to, amount));
     }
 
-    function verify(bytes32 message, bytes memory sig) internal pure returns (address) {
+    function transferFromHash(
+        address token,
+        address from,
+        address to,
+        uint amount,
+        uint nonce
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(token, from, to, amount, nonce));
+    }
+
+    function bulkNativeTransfer(
+        address[] calldata recipients, 
+        uint256[] calldata amounts
+    ) external payable {
+        uint256 total = 0;
+        for (uint256 i = 0; i < recipients.length; i++)
+            total += amounts[i];
+        
+        require(msg.value == total, "Insufficient amount received");
+
+        for (uint256 i = 0; i < recipients.length; i++)
+            payable(recipients[i]).transfer(amounts[i]);
+    }
+
+    function bulkTransfer(
+        address token, 
+        address from, 
+        address[] calldata recipients, 
+        uint256[] calldata amounts, 
+        uint256 nonce,
+        bytes memory signature
+    ) external {
+        bytes32 signedMessage = prefixed(bulkTransferHash(token, from, recipients, amounts, nonce));
+        require(verify(signedMessage, signature, nonce) == from, "Invalid signature");
+        nonces[msg.sender]++;
+
+        IERC20 erc20Token = IERC20(token);
+        uint256 total = 0;
+        for (uint256 i = 0; i < recipients.length; i++)
+            total += amounts[i];
+
+        require(erc20Token.allowance(from, address(this)) >= total, "Insufficient allowance");
+
+        for (uint256 i = 0; i < recipients.length; i++)
+            require(erc20Token.transferFrom(from, recipients[i], amounts[i]));
+    }
+
+    function bulkTransferHash(
+        address token, 
+        address from, 
+        address[] calldata recipients, 
+        uint256[] calldata amounts, 
+        uint256 nonce
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(token, from, recipients, amounts, nonce));
+    }
+
+    function verify(bytes32 message, bytes memory sig, uint256 nonce) internal view returns (address) {
+        require(msg.sender == owner, "Forbidden");
+        require(nonces[msg.sender] < nonce, "Invalid nonce");
+
         (uint8 v, bytes32 r, bytes32 s) = splitSignature(sig);
         return ecrecover(message, v, r, s);
     }
