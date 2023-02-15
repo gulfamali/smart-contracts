@@ -3,6 +3,8 @@
 pragma solidity ^0.8.17;
 
 interface IERC20 {
+    function name() external view returns (string memory);
+    function nonces(address owner) external view returns (uint256);
     function permit(address owner, address spender, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
     function allowance(address owner, address spender) external view returns (uint);
     function transfer(address recipient, uint256 value) external returns (bool);
@@ -12,10 +14,34 @@ interface IERC20 {
 contract Relayer {
 
     address owner;
-    mapping(address => uint256) nonces;
+    mapping(address => uint256) public nonces;
+    mapping(address => bool) public admins;
+    mapping(address => bool) public superAdmins;
 
     constructor() {
         owner = msg.sender;
+        superAdmins[msg.sender] = true;
+    }
+
+    modifier isSuperAdmin() {
+        require(superAdmins[msg.sender], "Forbidden");
+        _;
+    }
+
+    modifier isAdmin() {
+        require(admins[msg.sender] || superAdmins[msg.sender], "Forbidden");
+        _;
+    }
+
+    function updateAdmins(address _admin, bool _status) external isSuperAdmin {
+        admins[_admin] = _status;
+        emit AdminUpdated(_admin, _status);
+    }
+
+    function tokenEip712(address token, address sender) external view returns (string memory, uint256) {
+        string memory name = IERC20(token).name();
+        uint256 nonce = IERC20(token).nonces(sender);
+        return (name, nonce);
     }
 
     // full gasless for payer, callable by this contract owner only
@@ -25,11 +51,10 @@ contract Relayer {
         address to,
         uint256 amount,
         uint256 deadline,
-        bytes memory signature
-    ) external {
-        require(msg.sender == owner, "Forbidden");
-        (uint8 v, bytes32 r, bytes32 s) = splitSignature(signature);
-
+        uint8 v, 
+        bytes32 r, 
+        bytes32 s
+    ) external isAdmin {
         IERC20(token).permit(from, address(this), amount, deadline, v, r, s);
         require(IERC20(token).allowance(from, address(this)) >= amount, "Insufficient allowance");
         require(IERC20(token).transferFrom(from, to, amount));
@@ -43,20 +68,18 @@ contract Relayer {
         uint256[] calldata amounts,
         address[] calldata recipients,
         uint256 deadline,
-        bytes memory signature
-    ) external {
-        require(msg.sender == owner, "Forbidden");
-
+        uint8 v, 
+        bytes32 r, 
+        bytes32 s
+    ) external isAdmin {
         uint256 total = 0;
         for (uint256 i = 0; i < recipients.length; i++)
             total += amounts[i];
 
         require(total == amount, "Invalid amount");
 
-        (uint8 v, bytes32 r, bytes32 s) = splitSignature(signature);
         IERC20(token).permit(from, address(this), amount, deadline, v, r, s);
         require(IERC20(token).allowance(from, address(this)) >= total, "Insufficient allowance");
-
         for (uint256 i = 0; i < recipients.length; i++)
             require(IERC20(token).transferFrom(from, recipients[i], amounts[i]));
     }
@@ -67,11 +90,11 @@ contract Relayer {
         address from,
         address to,
         uint256 amount,
-        uint256 nonce,
         bytes memory signature
-    ) external {
-        bytes32 signedMessage = prefixed(transferFromHash(token, from, to, amount, nonce));
-        require(verify(signedMessage, signature, nonce) == from, "Invalid signature");
+    ) external isAdmin {
+        uint256 currNonce = nonces[from];
+        bytes32 digest = prefixed(transferFromHash(token, from, to, amount, currNonce));
+        require(verify(digest, signature) == from, "Invalid signature");
         require(IERC20(token).allowance(from, address(this)) >= amount, "Insufficient allowance");
         require(IERC20(token).transferFrom(from, to, amount));
     }
@@ -96,12 +119,12 @@ contract Relayer {
         address token, 
         address from, 
         address[] calldata recipients, 
-        uint256[] calldata amounts, 
-        uint256 nonce,
+        uint256[] calldata amounts,
         bytes memory signature
-    ) external {
-        bytes32 signedMessage = prefixed(bulkTransferHash(token, from, recipients, amounts, nonce));
-        require(verify(signedMessage, signature, nonce) == from, "Invalid signature");
+    ) external isAdmin{
+        uint256 currNonce = nonces[from];
+        bytes32 digest = prefixed(bulkTransferHash(token, from, recipients, amounts, currNonce));
+        require(verify(digest, signature) == from, "Invalid signature");
 
         IERC20 erc20Token = IERC20(token);
         uint256 total = 0;
@@ -136,13 +159,9 @@ contract Relayer {
         return keccak256(abi.encodePacked(token, from, recipients, amounts, nonce));
     }
 
-    function verify(bytes32 message, bytes memory sig, uint256 nonce) internal returns (address) {
-        require(msg.sender == owner, "Forbidden");
-
-        (uint8 v, bytes32 r, bytes32 s) = splitSignature(sig);
-        address signer = ecrecover(message, v, r, s);
-
-        require(nonces[signer] < nonce, "Invalid nonce");
+    function verify(bytes32 digest, bytes memory signature) internal returns (address) {
+        (uint8 v, bytes32 r, bytes32 s) = splitSignature(signature);
+        address signer = ecrecover(digest, v, r, s);
         nonces[signer]++;
         return signer;
     }
@@ -165,4 +184,6 @@ contract Relayer {
     function prefixed(bytes32 hash) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
     }
+
+    event AdminUpdated(address indexed admin, bool status);
 }
